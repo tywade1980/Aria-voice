@@ -190,10 +190,20 @@ async def get_messages(session_id: str):
 @api_router.post("/chat", response_model=Message)
 async def chat(message: MessageCreate):
     """
-    Chat endpoint - routes to OpenAI/Emergent or Runpod Mistral based on config
+    Chat endpoint - routes to OpenAI, Runpod Mistral, or Ollama based on settings
     """
-    runpod_endpoint = os.environ.get('RUNPOD_ENDPOINT', '')
-    use_runpod = os.environ.get('LLM_BACKEND', 'openai') == 'runpod'
+    # Get settings from DB
+    settings_doc = await db.settings.find_one({"id": "global_settings"}, {"_id": 0})
+    if not settings_doc:
+        settings_doc = Settings().model_dump()
+    
+    runpod_endpoint = settings_doc.get('runpod_endpoint', '')
+    ollama_endpoint = settings_doc.get('ollama_endpoint', 'http://localhost:11434')
+    llm_backend = settings_doc.get('llm_backend', 'openai')
+    llm_model = settings_doc.get('llm_model', 'mistral-uncensored')
+    system_prompt = settings_doc.get('system_prompt', 'You are a helpful assistant.')
+    temperature = settings_doc.get('temperature', 0.8)
+    max_tokens = settings_doc.get('max_tokens', 2048)
     
     # Get or create session
     session_id = message.session_id
@@ -222,41 +232,61 @@ async def chat(message: MessageCreate):
     ).sort("timestamp", 1).to_list(50)
     
     # Build messages list
-    system_message = """You are ARIA (Advanced Reasoning & Intelligent Assistant), a powerful AI orchestrator. 
-You help users manage their digital life, control agent swarms, and automate tasks.
-You can create skills, manage agents, and handle voice interactions.
-Be helpful, concise, and proactive in suggesting automations."""
-    
-    messages_list = [{"role": "system", "content": system_message}]
+    messages_list = [{"role": "system", "content": system_prompt}]
     for h in history[-10:]:  # Last 10 messages for context
         messages_list.append({"role": h.get("role", "user"), "content": h.get("content", "")})
     
     try:
         response_text = ""
         
-        # Try Runpod Mistral if configured
-        if use_runpod and runpod_endpoint:
+        # OLLAMA Backend
+        if llm_backend == "ollama":
+            try:
+                import requests as req
+                ollama_response = req.post(
+                    f"{ollama_endpoint}/api/chat",
+                    json={
+                        "model": llm_model,
+                        "messages": messages_list,
+                        "stream": False,
+                        "options": {
+                            "temperature": temperature,
+                            "num_predict": max_tokens
+                        }
+                    },
+                    timeout=120
+                )
+                ollama_response.raise_for_status()
+                data = ollama_response.json()
+                response_text = data.get('message', {}).get('content', '')
+                logger.info(f"Ollama response from {llm_model}")
+            except Exception as e:
+                logger.error(f"Ollama chat failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Ollama failed: {str(e)}")
+        
+        # RUNPOD Backend (Mistral/Llama on Runpod)
+        elif llm_backend == "runpod" and runpod_endpoint:
             try:
                 import requests as req
                 runpod_response = req.post(
                     f"{runpod_endpoint}/api/chat",
                     json={
                         "messages": messages_list,
-                        "max_tokens": 1024,
-                        "temperature": 0.7
+                        "max_tokens": max_tokens,
+                        "temperature": temperature
                     },
-                    headers={"Authorization": f"Bearer {os.environ.get('RUNPOD_API_KEY', '')}"},
+                    headers={"Authorization": f"Bearer {settings_doc.get('runpod_api_key', '')}"},
                     timeout=120
                 )
                 runpod_response.raise_for_status()
                 data = runpod_response.json()
                 response_text = data.get('response', '')
             except Exception as e:
-                logger.warning(f"Runpod chat failed, falling back to OpenAI: {e}")
-                use_runpod = False
+                logger.error(f"Runpod chat failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Runpod failed: {str(e)}")
         
-        # Fallback to OpenAI/Emergent
-        if not response_text:
+        # OPENAI/Emergent Backend (default fallback)
+        else:
             from emergentintegrations.llm.chat import LlmChat, UserMessage
             
             api_key = os.environ.get('EMERGENT_LLM_KEY')
@@ -266,7 +296,7 @@ Be helpful, concise, and proactive in suggesting automations."""
             chat_instance = LlmChat(
                 api_key=api_key,
                 session_id=session_id,
-                system_message=system_message
+                system_message=system_prompt
             ).with_model("openai", "gpt-5.2")
             
             user_message = UserMessage(text=message.content)
@@ -289,6 +319,8 @@ Be helpful, concise, and proactive in suggesting automations."""
         )
         
         return assistant_msg
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
