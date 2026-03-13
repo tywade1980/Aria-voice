@@ -101,17 +101,19 @@ export default function SettingsPage() {
       const { data } = await axios.post(`${API}/tts/base64`, {
         text: "Hello! This is ARIA, your AI voice assistant. Settings test successful.",
         voice: settings.default_voice,
-        speed: settings.tts_speed
+        speed: settings.tts_speed,
+        engine: settings.tts_engine
       });
 
-      const audio = new Audio(`data:audio/mp3;base64,${data.audio}`);
+      const mimeType = data.format === "wav" ? "audio/wav" : "audio/mpeg";
+      const audio = new Audio(`data:${mimeType};base64,${data.audio}`);
       audio.onended = () => setIsTesting(false);
       audio.onerror = () => {
         setIsTesting(false);
         toast.error("Audio playback failed");
       };
       await audio.play();
-      toast.success("TTS working correctly");
+      toast.success(`TTS working (${data.engine})`);
     } catch (error) {
       toast.error("TTS test failed");
       setIsTesting(false);
