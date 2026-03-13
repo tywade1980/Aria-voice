@@ -123,6 +123,7 @@ class TTSRequest(BaseModel):
     text: str
     voice: str = "alloy"
     speed: float = 1.0
+    engine: str = "openai"  # openai, xtts, fish, styletts2
 
 class STTResponse(BaseModel):
     text: str
