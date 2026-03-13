@@ -74,7 +74,9 @@ export default function SettingsPage() {
         runpod_api_key: data.runpod_api_key || "",
         default_model: data.default_model || "gpt-5.2",
         default_voice: data.default_voice || "nova",
-        tts_speed: data.tts_speed || 1.0
+        tts_speed: data.tts_speed || 1.0,
+        tts_engine: data.tts_engine || "openai",
+        llm_backend: data.llm_backend || "openai"
       });
     } catch (error) {
       console.error("Failed to fetch settings:", error);
