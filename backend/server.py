@@ -109,6 +109,8 @@ class SettingsUpdate(BaseModel):
     default_model: Optional[str] = None
     default_voice: Optional[str] = None
     tts_speed: Optional[float] = None
+    tts_engine: Optional[str] = None  # openai, xtts, fish, styletts2
+    llm_backend: Optional[str] = None  # openai, runpod
 
 class Settings(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -118,6 +120,8 @@ class Settings(BaseModel):
     default_model: str = "gpt-5.2"
     default_voice: str = "alloy"
     tts_speed: float = 1.0
+    tts_engine: str = "openai"  # openai, xtts, fish, styletts2
+    llm_backend: str = "openai"  # openai, runpod
 
 class TTSRequest(BaseModel):
     text: str
