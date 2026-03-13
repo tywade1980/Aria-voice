@@ -149,22 +149,25 @@ export default function SettingsPage() {
             Runpod Configuration
           </CardTitle>
           <CardDescription>
-            Configure your Runpod endpoint for Mistral model inference
+            Configure your Runpod pod endpoint for TTS engines and Mistral LLM
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <Label>Runpod Endpoint URL</Label>
+            <Label>Runpod Pod URL</Label>
             <Input
               value={settings.runpod_endpoint}
               onChange={(e) => setSettings({ ...settings, runpod_endpoint: e.target.value })}
-              placeholder="https://api.runpod.ai/v2/your-endpoint-id/runsync"
+              placeholder="http://your-pod-ip:8000"
               className="font-mono text-sm"
               data-testid="runpod-endpoint-input"
             />
+            <p className="text-xs text-muted-foreground">
+              URL of your ARIA container running on Runpod (Fish Speech, XTTS, StyleTTS2, Mistral)
+            </p>
           </div>
           <div className="space-y-2">
-            <Label>Runpod API Key</Label>
+            <Label>Runpod API Key (Optional)</Label>
             <Input
               type="password"
               value={settings.runpod_api_key}
@@ -173,6 +176,76 @@ export default function SettingsPage() {
               data-testid="runpod-key-input"
             />
           </div>
+        </CardContent>
+      </Card>
+
+      {/* LLM Backend */}
+      <Card className="glass border-border/50" data-testid="llm-settings">
+        <CardHeader>
+          <CardTitle className="font-heading flex items-center gap-2">
+            <Key className="w-5 h-5 text-secondary" />
+            LLM Backend
+          </CardTitle>
+          <CardDescription>
+            Choose between OpenAI (Emergent) or Mistral (Runpod)
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Select
+            value={settings.llm_backend}
+            onValueChange={(value) => setSettings({ ...settings, llm_backend: value })}
+          >
+            <SelectTrigger data-testid="llm-backend-select">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {llmBackendOptions.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {settings.llm_backend === "runpod" && !settings.runpod_endpoint && (
+            <p className="text-xs text-orange-500">
+              Configure Runpod endpoint above to use Mistral
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* TTS Engine */}
+      <Card className="glass border-border/50" data-testid="tts-engine-settings">
+        <CardHeader>
+          <CardTitle className="font-heading flex items-center gap-2">
+            <Volume2 className="w-5 h-5 text-green-500" />
+            TTS Engine
+          </CardTitle>
+          <CardDescription>
+            Select text-to-speech engine
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Select
+            value={settings.tts_engine}
+            onValueChange={(value) => setSettings({ ...settings, tts_engine: value })}
+          >
+            <SelectTrigger data-testid="tts-engine-select">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {ttsEngineOptions.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {settings.tts_engine !== "openai" && !settings.runpod_endpoint && (
+            <p className="text-xs text-orange-500">
+              Configure Runpod endpoint above to use {settings.tts_engine.toUpperCase()}
+            </p>
+          )}
         </CardContent>
       </Card>
 
