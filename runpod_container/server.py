@@ -304,9 +304,280 @@ async def root():
             "stt": "/api/stt",
             "settings": "/api/settings",
             "voices": "/api/voices",
-            "conversations": "/api/conversations"
+            "conversations": "/api/conversations",
+            "ui": "/ui"
         }
     }
+
+@app.get("/ui", response_class=HTMLResponse)
+async def settings_ui():
+    """Web UI for configuring settings - access via browser"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARIA Settings</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+            font-family: 'Segoe UI', system-ui, sans-serif; 
+            background: #0a0a0a; 
+            color: #fff; 
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { color: #00f0ff; margin-bottom: 0.5rem; font-size: 2rem; }
+        .subtitle { color: #666; margin-bottom: 2rem; }
+        .card { 
+            background: #111; 
+            border: 1px solid #222; 
+            border-radius: 12px; 
+            padding: 1.5rem; 
+            margin-bottom: 1.5rem;
+        }
+        .card h2 { color: #00f0ff; font-size: 1.1rem; margin-bottom: 1rem; }
+        label { display: block; color: #888; font-size: 0.85rem; margin-bottom: 0.5rem; }
+        input, select, textarea {
+            width: 100%;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            color: #fff;
+            padding: 0.75rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            margin-bottom: 1rem;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #00f0ff;
+        }
+        textarea { min-height: 120px; resize: vertical; font-family: monospace; }
+        button {
+            background: #00f0ff;
+            color: #000;
+            border: none;
+            padding: 0.75rem 2rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        button:hover { opacity: 0.8; }
+        button.secondary { background: #333; color: #fff; }
+        .row { display: flex; gap: 1rem; }
+        .row > * { flex: 1; }
+        .status { padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
+        .status.success { background: rgba(0,255,0,0.1); border: 1px solid #0f0; }
+        .status.error { background: rgba(255,0,0,0.1); border: 1px solid #f00; }
+        .hidden { display: none; }
+        .test-section { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #222; }
+        #testOutput { 
+            background: #050505; 
+            padding: 1rem; 
+            border-radius: 8px; 
+            font-family: monospace; 
+            font-size: 0.85rem;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ARIA Settings</h1>
+        <p class="subtitle">Configure your voice agent</p>
+        
+        <div id="statusMsg" class="status hidden"></div>
+        
+        <div class="card">
+            <h2>Persona & Behavior</h2>
+            <label>Persona Name</label>
+            <input type="text" id="persona_name" placeholder="ARIA">
+            
+            <label>System Prompt</label>
+            <textarea id="system_prompt" placeholder="Define the AI's personality and behavior..."></textarea>
+        </div>
+        
+        <div class="card">
+            <h2>LLM Settings</h2>
+            <div class="row">
+                <div>
+                    <label>Model</label>
+                    <select id="llm_model">
+                        <option value="mistral-uncensored">Mistral Uncensored (Dolphin)</option>
+                        <option value="dolphin-mistral">Dolphin 2.9 Llama3</option>
+                        <option value="llama2-uncensored">Llama 2 Uncensored</option>
+                        <option value="llama3">Llama 3 8B</option>
+                        <option value="mistral-7b">Mistral 7B</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Temperature</label>
+                    <input type="number" id="temperature" min="0" max="2" step="0.1" value="0.8">
+                </div>
+            </div>
+            <div class="row">
+                <div>
+                    <label>Max Tokens</label>
+                    <input type="number" id="max_tokens" min="256" max="8192" value="2048">
+                </div>
+                <div>
+                    <label>Top P</label>
+                    <input type="number" id="top_p" min="0" max="1" step="0.05" value="0.9">
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>TTS Settings</h2>
+            <div class="row">
+                <div>
+                    <label>TTS Engine</label>
+                    <select id="tts_engine">
+                        <option value="xtts">XTTS v2</option>
+                        <option value="fish">Fish Speech 1.5</option>
+                        <option value="styletts2">StyleTTS2</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Voice</label>
+                    <input type="text" id="tts_voice" placeholder="default">
+                </div>
+            </div>
+            <div class="row">
+                <div>
+                    <label>Speed</label>
+                    <input type="number" id="tts_speed" min="0.5" max="2" step="0.1" value="1.0">
+                </div>
+                <div>
+                    <label>STT Language</label>
+                    <input type="text" id="stt_language" value="en" placeholder="en">
+                </div>
+            </div>
+        </div>
+        
+        <div class="row">
+            <button onclick="saveSettings()">Save Settings</button>
+            <button class="secondary" onclick="loadSettings()">Reload</button>
+        </div>
+        
+        <div class="card" style="margin-top: 1.5rem;">
+            <h2>Test</h2>
+            <div class="row">
+                <input type="text" id="testText" placeholder="Enter test message...">
+                <button class="secondary" onclick="testChat()">Test Chat</button>
+                <button class="secondary" onclick="testTTS()">Test TTS</button>
+            </div>
+            <div id="testOutput" style="margin-top: 1rem;">Ready for testing...</div>
+        </div>
+    </div>
+    
+    <script>
+        const fields = ['persona_name', 'system_prompt', 'llm_model', 'temperature', 'max_tokens', 
+                        'top_p', 'tts_engine', 'tts_voice', 'tts_speed', 'stt_language'];
+        
+        async function loadSettings() {
+            try {
+                const res = await fetch('/api/settings');
+                const data = await res.json();
+                fields.forEach(f => {
+                    const el = document.getElementById(f);
+                    if (el && data[f] !== undefined) {
+                        el.value = data[f];
+                    }
+                });
+                showStatus('Settings loaded', 'success');
+            } catch (e) {
+                showStatus('Failed to load settings: ' + e.message, 'error');
+            }
+        }
+        
+        async function saveSettings() {
+            try {
+                const settings = {};
+                fields.forEach(f => {
+                    const el = document.getElementById(f);
+                    if (el) {
+                        let val = el.value;
+                        if (['temperature', 'top_p', 'tts_speed'].includes(f)) val = parseFloat(val);
+                        if (['max_tokens'].includes(f)) val = parseInt(val);
+                        settings[f] = val;
+                    }
+                });
+                
+                const res = await fetch('/api/settings', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+                
+                if (res.ok) {
+                    showStatus('Settings saved!', 'success');
+                } else {
+                    throw new Error('Save failed');
+                }
+            } catch (e) {
+                showStatus('Failed to save: ' + e.message, 'error');
+            }
+        }
+        
+        async function testChat() {
+            const text = document.getElementById('testText').value || 'Hello, who are you?';
+            document.getElementById('testOutput').textContent = 'Sending...';
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({messages: [{role: 'user', content: text}]})
+                });
+                const data = await res.json();
+                document.getElementById('testOutput').textContent = 
+                    `Model: ${data.model}\\nTokens: ${data.tokens_used}\\n\\nResponse:\\n${data.response}`;
+            } catch (e) {
+                document.getElementById('testOutput').textContent = 'Error: ' + e.message;
+            }
+        }
+        
+        async function testTTS() {
+            const text = document.getElementById('testText').value || 'Hello, this is a test.';
+            document.getElementById('testOutput').textContent = 'Generating audio...';
+            try {
+                const engine = document.getElementById('tts_engine').value;
+                const res = await fetch('/api/tts', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: text, engine: engine})
+                });
+                const data = await res.json();
+                
+                document.getElementById('testOutput').textContent = 
+                    `Engine: ${data.engine}\\nDuration: ${data.duration}s\\nPlaying audio...`;
+                
+                const audio = new Audio('data:audio/wav;base64,' + data.audio_base64);
+                audio.play();
+            } catch (e) {
+                document.getElementById('testOutput').textContent = 'Error: ' + e.message;
+            }
+        }
+        
+        function showStatus(msg, type) {
+            const el = document.getElementById('statusMsg');
+            el.textContent = msg;
+            el.className = 'status ' + type;
+            setTimeout(() => el.className = 'status hidden', 3000);
+        }
+        
+        // Load on page load
+        loadSettings();
+    </script>
+</body>
+</html>
+"""
 
 @app.get("/health")
 async def health_check():
