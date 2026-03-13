@@ -170,11 +170,11 @@ async def get_messages(session_id: str):
 
 @api_router.post("/chat", response_model=Message)
 async def chat(message: MessageCreate):
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
-    
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
-    if not api_key:
-        raise HTTPException(status_code=500, detail="LLM API key not configured")
+    """
+    Chat endpoint - routes to OpenAI/Emergent or Runpod Mistral based on config
+    """
+    runpod_endpoint = os.environ.get('RUNPOD_ENDPOINT', '')
+    use_runpod = os.environ.get('LLM_BACKEND', 'openai') == 'runpod'
     
     # Get or create session
     session_id = message.session_id
@@ -202,21 +202,56 @@ async def chat(message: MessageCreate):
         {"_id": 0}
     ).sort("timestamp", 1).to_list(50)
     
-    # Build context from history
+    # Build messages list
     system_message = """You are ARIA (Advanced Reasoning & Intelligent Assistant), a powerful AI orchestrator. 
 You help users manage their digital life, control agent swarms, and automate tasks.
 You can create skills, manage agents, and handle voice interactions.
 Be helpful, concise, and proactive in suggesting automations."""
     
+    messages_list = [{"role": "system", "content": system_message}]
+    for h in history[-10:]:  # Last 10 messages for context
+        messages_list.append({"role": h.get("role", "user"), "content": h.get("content", "")})
+    
     try:
-        chat_instance = LlmChat(
-            api_key=api_key,
-            session_id=session_id,
-            system_message=system_message
-        ).with_model("openai", "gpt-5.2")
+        response_text = ""
         
-        user_message = UserMessage(text=message.content)
-        response_text = await chat_instance.send_message(user_message)
+        # Try Runpod Mistral if configured
+        if use_runpod and runpod_endpoint:
+            try:
+                import requests as req
+                runpod_response = req.post(
+                    f"{runpod_endpoint}/api/chat",
+                    json={
+                        "messages": messages_list,
+                        "max_tokens": 1024,
+                        "temperature": 0.7
+                    },
+                    headers={"Authorization": f"Bearer {os.environ.get('RUNPOD_API_KEY', '')}"},
+                    timeout=120
+                )
+                runpod_response.raise_for_status()
+                data = runpod_response.json()
+                response_text = data.get('response', '')
+            except Exception as e:
+                logger.warning(f"Runpod chat failed, falling back to OpenAI: {e}")
+                use_runpod = False
+        
+        # Fallback to OpenAI/Emergent
+        if not response_text:
+            from emergentintegrations.llm.chat import LlmChat, UserMessage
+            
+            api_key = os.environ.get('EMERGENT_LLM_KEY')
+            if not api_key:
+                raise HTTPException(status_code=500, detail="LLM API key not configured")
+            
+            chat_instance = LlmChat(
+                api_key=api_key,
+                session_id=session_id,
+                system_message=system_message
+            ).with_model("openai", "gpt-5.2")
+            
+            user_message = UserMessage(text=message.content)
+            response_text = await chat_instance.send_message(user_message)
         
         # Save assistant response
         assistant_msg = Message(
