@@ -307,6 +307,34 @@ async def text_to_speech(request: TTSRequest):
 
 @api_router.post("/tts/base64")
 async def text_to_speech_base64(request: TTSRequest):
+    """
+    TTS endpoint returning base64 - routes to OpenAI or Runpod
+    """
+    runpod_endpoint = os.environ.get('RUNPOD_ENDPOINT', '')
+    
+    # If using Runpod engines and endpoint is configured
+    if request.engine in ['xtts', 'fish', 'styletts2'] and runpod_endpoint:
+        try:
+            import requests as req
+            runpod_response = req.post(
+                f"{runpod_endpoint}/api/tts",
+                json={
+                    "text": request.text,
+                    "engine": request.engine,
+                    "language": "en",
+                    "speed": request.speed
+                },
+                headers={"Authorization": f"Bearer {os.environ.get('RUNPOD_API_KEY', '')}"},
+                timeout=60
+            )
+            runpod_response.raise_for_status()
+            data = runpod_response.json()
+            return {"audio": data['audio_base64'], "format": "wav", "engine": request.engine}
+        except Exception as e:
+            logger.error(f"Runpod TTS error: {e}")
+            raise HTTPException(status_code=500, detail=f"Runpod TTS failed: {str(e)}")
+    
+    # Default to OpenAI TTS
     from emergentintegrations.llm.openai import OpenAITextToSpeech
     
     api_key = os.environ.get('EMERGENT_LLM_KEY')
@@ -323,7 +351,7 @@ async def text_to_speech_base64(request: TTSRequest):
             response_format="mp3"
         )
         
-        return {"audio": audio_base64, "format": "mp3"}
+        return {"audio": audio_base64, "format": "mp3", "engine": "openai"}
     except Exception as e:
         logger.error(f"TTS error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
