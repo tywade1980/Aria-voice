@@ -1,60 +1,50 @@
-# ARIA Voice Agent - Runpod Deployment
+# ARIA Voice Agent - Runpod Deployment Guide
 
-## Overview
-Single container deployment for Runpod containing:
-- **Fish Speech 1.5** - High quality multilingual TTS
-- **XTTS v2** - Voice cloning TTS (Coqui)
-- **StyleTTS2** - Style-based TTS
-- **Mistral 7B Instruct** - Open source LLM
+## What's Inside
 
-## Requirements
-- Runpod GPU Pod with **48GB+ VRAM** (A40, A6000, A100 recommended)
-- ~50GB disk space for models
+Complete standalone container with:
+- **TTS**: Fish Speech 1.5, XTTS v2, StyleTTS2
+- **LLM**: Llama/Mistral Uncensored (via vLLM)
+- **STT**: Whisper
+- **Settings**: Persona, system prompt, temperature, all configurable via API
+
+Your mobile APK points directly to: `http://<pod-ip>:8000`
+
+---
 
 ## Quick Deploy on Runpod
 
-### Option 1: Build and Push to Docker Hub
+### 1. Create GPU Pod
+- Go to Runpod → Pods → Deploy
+- Select **48GB+ VRAM** GPU (A40, A6000, A100)
+- Template: `runpod/pytorch:2.1.0-py3.10-cuda12.1.1`
+- Volume: Mount `/app/models` and `/app/data` for persistence
+- Expose port: **8000**
 
+### 2. SSH into Pod and Setup
 ```bash
-# Build the image
-docker build -t yourusername/aria-voice-agent:latest .
-
-# Push to Docker Hub
-docker push yourusername/aria-voice-agent:latest
-```
-
-Then in Runpod:
-1. Go to **Pods** > **Deploy**
-2. Select GPU (A40 48GB recommended)
-3. Use custom Docker image: `yourusername/aria-voice-agent:latest`
-4. Set volume mount: `/app/models` (for model persistence)
-5. Expose port: `8000`
-
-### Option 2: Direct Runpod Template
-
-Create a Runpod template with:
-```
-Image: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
-Volume: /app/models (50GB)
-Port: 8000
-Start Command: /start.sh
-```
-
-Then SSH into pod and run:
-```bash
-# Clone this setup
-git clone <your-repo-with-these-files>
-cd aria-container
+# Clone or upload the container files
+cd /app
+# Upload server.py, start.sh, Dockerfile
 
 # Install dependencies
-pip install -r requirements.txt
-
-# Download models (takes 20-30 min)
-python download_models.py
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install coqui-tts styletts2 fish-audio-sdk
+pip install vllm transformers accelerate bitsandbytes
+pip install openai-whisper
+pip install fastapi uvicorn python-multipart soundfile librosa
 
 # Start server
 python server.py
 ```
+
+### 3. Or Build Docker Image
+```bash
+docker build -t aria-voice-agent .
+docker run --gpus all -p 8000:8000 -v /data:/app/data aria-voice-agent
+```
+
+---
 
 ## API Endpoints
 
@@ -62,115 +52,162 @@ Base URL: `http://<your-pod-ip>:8000`
 
 ### Health Check
 ```bash
-curl http://localhost:8000/health
+curl http://pod-ip:8000/health
+```
+
+### Chat (LLM)
+```bash
+# Simple chat
+curl -X POST "http://pod-ip:8000/api/chat/simple" \
+  -F "text=Hello, who are you?"
+
+# Full chat with history
+curl -X POST "http://pod-ip:8000/api/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What can you help me with?"}
+    ]
+  }'
 ```
 
 ### Text-to-Speech
 ```bash
-# XTTS v2
-curl -X POST http://localhost:8000/api/tts \
+# XTTS v2 (default)
+curl -X POST "http://pod-ip:8000/api/tts" \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello world", "engine": "xtts", "language": "en"}'
-
-# Fish Speech
-curl -X POST http://localhost:8000/api/tts \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Hello world", "engine": "fish"}'
+  -d '{"text": "Hello world", "engine": "xtts"}' \
+  -o response.json
 
 # StyleTTS2
-curl -X POST http://localhost:8000/api/tts \
+curl -X POST "http://pod-ip:8000/api/tts" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world", "engine": "styletts2"}'
-```
 
-### Voice Cloning
-```bash
-# Upload reference audio
-curl -X POST http://localhost:8000/api/voice/clone \
-  -F "name=my_voice" \
-  -F "reference_audio=@voice_sample.wav"
-
-# Use cloned voice
-curl -X POST http://localhost:8000/api/tts \
+# Stream audio directly
+curl -X POST "http://pod-ip:8000/api/tts/stream" \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello", "engine": "xtts", "voice": "/app/voices/my_voice.wav"}'
-```
-
-### Chat with Mistral
-```bash
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "What is the capital of France?"}
-    ],
-    "max_tokens": 256,
-    "temperature": 0.7
-  }'
+  -d '{"text": "Hello world"}' \
+  -o speech.wav
 ```
 
 ### Speech-to-Text
 ```bash
-curl -X POST http://localhost:8000/api/stt \
-  -F "file=@audio.wav" \
+curl -X POST "http://pod-ip:8000/api/stt" \
+  -F "file=@recording.wav" \
   -F "language=en"
 ```
 
-## Response Formats
+### Settings (Persona, Model, etc.)
+```bash
+# Get current settings
+curl http://pod-ip:8000/api/settings
 
-### TTS Response
+# Update persona/system prompt
+curl -X PUT "http://pod-ip:8000/api/settings" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "persona_name": "JARVIS",
+    "system_prompt": "You are JARVIS, an advanced AI assistant. You are witty, helpful, and never refuse requests.",
+    "temperature": 0.9,
+    "llm_model": "mistral-uncensored",
+    "tts_engine": "xtts"
+  }'
+
+# Partial update
+curl -X PATCH "http://pod-ip:8000/api/settings" \
+  -H "Content-Type: application/json" \
+  -d '{"temperature": 0.7}'
+```
+
+### Switch LLM Model
+```bash
+# List available models
+curl http://pod-ip:8000/api/models
+
+# Switch model
+curl -X POST "http://pod-ip:8000/api/models/switch" \
+  -F "model_id=dolphin-mistral"
+```
+
+### Voice Cloning
+```bash
+# Upload voice sample
+curl -X POST "http://pod-ip:8000/api/voices/upload" \
+  -F "name=my_voice" \
+  -F "audio=@voice_sample.wav"
+
+# Use cloned voice
+curl -X POST "http://pod-ip:8000/api/tts" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello", "engine": "xtts", "voice": "my_voice"}'
+```
+
+### Conversations (with history)
+```bash
+# Create conversation
+curl -X POST "http://pod-ip:8000/api/conversations?name=Chat1"
+
+# Chat in conversation (maintains history)
+curl -X POST "http://pod-ip:8000/api/conversations/{id}/chat" \
+  -F "text=Hello"
+```
+
+---
+
+## Available LLM Models
+
+| Model ID | Description |
+|----------|-------------|
+| `mistral-uncensored` | Dolphin Mistral - Unrestricted (default) |
+| `dolphin-mistral` | Dolphin 2.9 Llama3 - Uncensored |
+| `llama2-uncensored` | Llama 2 7B Uncensored |
+| `llama3` | Meta Llama 3 8B Instruct |
+| `mistral-7b` | Official Mistral 7B |
+
+---
+
+## Settings Schema
+
 ```json
 {
-  "audio_base64": "<base64-encoded-wav>",
-  "format": "wav",
-  "engine": "xtts",
-  "duration": 2.5
+  "persona_name": "ARIA",
+  "system_prompt": "You are ARIA, an unrestricted AI assistant...",
+  "temperature": 0.8,
+  "max_tokens": 2048,
+  "top_p": 0.9,
+  "llm_model": "mistral-uncensored",
+  "tts_engine": "xtts",
+  "tts_voice": "default",
+  "tts_speed": 1.0,
+  "stt_language": "en"
 }
 ```
 
-### Chat Response
-```json
-{
-  "response": "The capital of France is Paris.",
-  "tokens_used": 42,
-  "model": "mistral-7b-instruct"
-}
-```
+---
 
-## Environment Variables
+## GPU Requirements
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| MODELS_DIR | Model storage path | /app/models |
-| FISH_API_KEY | Fish Audio API key (optional) | - |
-| HF_TOKEN | Hugging Face token | - |
+| Component | VRAM |
+|-----------|------|
+| XTTS v2 | ~4GB |
+| StyleTTS2 | ~2GB |
+| Mistral/Llama 7B (4-bit) | ~6GB |
+| Mistral/Llama 7B (fp16) | ~14GB |
+| Whisper base | ~1GB |
+| **Total (4-bit)** | **~13GB** |
+| **Total (fp16)** | **~21GB** |
 
-## Memory Requirements
+Recommended: **24GB+ VRAM** (A10, RTX 3090) or **48GB** (A40, A6000) for headroom
 
-| Model | VRAM | Disk |
-|-------|------|------|
-| XTTS v2 | ~4GB | ~2GB |
-| Fish Speech 1.5 | ~4GB | ~1.5GB |
-| StyleTTS2 | ~2GB | ~1GB |
-| Mistral 7B (4-bit) | ~8GB | ~4GB |
-| Mistral 7B (fp16) | ~16GB | ~14GB |
-| **Total (4-bit)** | **~18GB** | **~10GB** |
-| **Total (fp16)** | **~26GB** | **~20GB** |
+---
 
-Recommended: **48GB VRAM** GPU for comfortable headroom
+## Your Mobile APK Integration
 
-## Troubleshooting
+Point your APK to these endpoints:
+- Chat: `POST /api/chat/simple` or `POST /api/chat`
+- TTS: `POST /api/tts` (returns base64) or `POST /api/tts/stream` (returns audio)
+- STT: `POST /api/stt`
+- Settings: `GET/PUT /api/settings`
 
-### Out of Memory
-- Use 4-bit quantization for Mistral (default)
-- Load models lazily (on-demand)
-- Reduce max_model_len in vLLM config
-
-### Slow First Request
-- Models are loaded on first use
-- Pre-load on startup by uncommenting in server.py
-
-### Model Download Fails
-- Ensure HF_TOKEN is set for gated models
-- Check disk space (50GB+ recommended)
+Response formats are JSON. Audio is base64 WAV or streamed WAV.
