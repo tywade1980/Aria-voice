@@ -19,15 +19,27 @@ import { Separator } from "@/components/ui/separator";
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 const voiceOptions = [
-  { value: "alloy", label: "Alloy - Neutral" },
-  { value: "ash", label: "Ash - Clear" },
-  { value: "coral", label: "Coral - Warm" },
-  { value: "echo", label: "Echo - Calm" },
-  { value: "fable", label: "Fable - Expressive" },
-  { value: "nova", label: "Nova - Energetic" },
-  { value: "onyx", label: "Onyx - Deep" },
-  { value: "sage", label: "Sage - Wise" },
-  { value: "shimmer", label: "Shimmer - Cheerful" },
+  { value: "alloy", label: "Alloy - Neutral (OpenAI)" },
+  { value: "ash", label: "Ash - Clear (OpenAI)" },
+  { value: "coral", label: "Coral - Warm (OpenAI)" },
+  { value: "echo", label: "Echo - Calm (OpenAI)" },
+  { value: "fable", label: "Fable - Expressive (OpenAI)" },
+  { value: "nova", label: "Nova - Energetic (OpenAI)" },
+  { value: "onyx", label: "Onyx - Deep (OpenAI)" },
+  { value: "sage", label: "Sage - Wise (OpenAI)" },
+  { value: "shimmer", label: "Shimmer - Cheerful (OpenAI)" },
+];
+
+const ttsEngineOptions = [
+  { value: "openai", label: "OpenAI TTS" },
+  { value: "xtts", label: "XTTS v2 (Runpod)" },
+  { value: "fish", label: "Fish Speech 1.5 (Runpod)" },
+  { value: "styletts2", label: "StyleTTS2 (Runpod)" },
+];
+
+const llmBackendOptions = [
+  { value: "openai", label: "OpenAI GPT-5.2 (Emergent)" },
+  { value: "runpod", label: "Mistral 7B (Runpod)" },
 ];
 
 const modelOptions = [
