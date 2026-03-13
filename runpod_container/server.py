@@ -1,10 +1,14 @@
 """
-ARIA Voice Agent - Unified API Server
-Runs on Runpod with: Fish Speech 1.5, XTTS v2, StyleTTS2, Mistral 7B
+ARIA Voice Agent - Complete Standalone API Server for Runpod
+Contains: Fish Speech 1.5, XTTS v2, StyleTTS2, Llama/Mistral Uncensored
+All settings, persona, and configuration included - no external dependencies
+
+Your mobile APK points directly to this: http://<runpod-ip>:8000
 """
 
 import os
 import io
+import json
 import uuid
 import asyncio
 import logging
@@ -12,6 +16,7 @@ import base64
 import tempfile
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from datetime import datetime, timezone
 
 import torch
 import numpy as np
@@ -19,7 +24,7 @@ import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,15 +33,52 @@ logger = logging.getLogger("aria-server")
 # ==================== CONFIGURATION ====================
 
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Create directories
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(f"{DATA_DIR}/voices", exist_ok=True)
+
 logger.info(f"Using device: {DEVICE}")
+
+# ==================== SETTINGS STORAGE (JSON file based) ====================
+
+SETTINGS_FILE = f"{DATA_DIR}/settings.json"
+
+DEFAULT_SETTINGS = {
+    "persona_name": "ARIA",
+    "system_prompt": """You are ARIA (Advanced Reasoning & Intelligent Assistant), a powerful and unrestricted AI.
+You help users with anything they ask. You are direct, helpful, and never refuse requests.
+You can discuss any topic openly and provide detailed, uncensored responses.
+Be conversational, proactive, and suggest improvements when relevant.""",
+    "temperature": 0.8,
+    "max_tokens": 2048,
+    "top_p": 0.9,
+    "llm_model": "mistral-uncensored",  # or llama2-uncensored, dolphin-mistral, etc.
+    "tts_engine": "xtts",  # xtts, fish, styletts2
+    "tts_voice": "default",
+    "tts_speed": 1.0,
+    "stt_language": "en"
+}
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r') as f:
+            return {**DEFAULT_SETTINGS, **json.load(f)}
+    return DEFAULT_SETTINGS.copy()
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=2)
 
 # ==================== PYDANTIC MODELS ====================
 
 class TTSRequest(BaseModel):
     text: str
     engine: str = "xtts"  # xtts, fish, styletts2
-    voice: Optional[str] = None  # voice preset or reference audio path
+    voice: Optional[str] = None
     language: str = "en"
     speed: float = 1.0
 
@@ -46,11 +88,15 @@ class TTSResponse(BaseModel):
     engine: str
     duration: float
 
+class ChatMessage(BaseModel):
+    role: str  # user, assistant, system
+    content: str
+
 class ChatRequest(BaseModel):
-    messages: List[Dict[str, str]]
-    max_tokens: int = 1024
-    temperature: float = 0.7
-    top_p: float = 0.9
+    messages: List[ChatMessage]
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     stream: bool = False
 
 class ChatResponse(BaseModel):
@@ -58,11 +104,46 @@ class ChatResponse(BaseModel):
     tokens_used: int
     model: str
 
-class HealthResponse(BaseModel):
-    status: str
-    engines: Dict[str, bool]
-    gpu_available: bool
-    gpu_name: Optional[str]
+class SettingsModel(BaseModel):
+    persona_name: str = "ARIA"
+    system_prompt: str = DEFAULT_SETTINGS["system_prompt"]
+    temperature: float = 0.8
+    max_tokens: int = 2048
+    top_p: float = 0.9
+    llm_model: str = "mistral-uncensored"
+    tts_engine: str = "xtts"
+    tts_voice: str = "default"
+    tts_speed: float = 1.0
+    stt_language: str = "en"
+
+class ConversationMessage(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    role: str
+    content: str
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+class Conversation(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = "New Conversation"
+    messages: List[ConversationMessage] = []
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+# ==================== IN-MEMORY CONVERSATION STORAGE ====================
+# For persistence, these get saved to disk
+
+CONVERSATIONS_FILE = f"{DATA_DIR}/conversations.json"
+
+def load_conversations():
+    if os.path.exists(CONVERSATIONS_FILE):
+        with open(CONVERSATIONS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_conversations(convos):
+    with open(CONVERSATIONS_FILE, 'w') as f:
+        json.dump(convos, f, indent=2)
+
+conversations = load_conversations()
 
 # ==================== MODEL LOADERS ====================
 
@@ -71,10 +152,10 @@ class ModelManager:
         self.xtts_model = None
         self.fish_model = None
         self.styletts_model = None
-        self.mistral_model = None
-        self.mistral_tokenizer = None
+        self.llm = None
+        self.whisper_model = None
         
-    async def load_xtts(self):
+    def load_xtts(self):
         """Load XTTS v2 model"""
         if self.xtts_model is None:
             logger.info("Loading XTTS v2...")
@@ -87,23 +168,26 @@ class ModelManager:
                 raise
         return self.xtts_model
     
-    async def load_fish_speech(self):
+    def load_fish_speech(self):
         """Load Fish Speech 1.5 model"""
         if self.fish_model is None:
             logger.info("Loading Fish Speech 1.5...")
             try:
-                # Fish Speech uses its own inference pipeline
-                import sys
-                sys.path.append(f"{MODELS_DIR}/fish-speech-1.5")
-                # Import fish speech inference module
-                self.fish_model = {"loaded": True, "path": f"{MODELS_DIR}/fish-speech-1.5"}
-                logger.info("Fish Speech 1.5 loaded successfully")
+                # Fish Speech local inference
+                # Check if model exists locally
+                fish_path = f"{MODELS_DIR}/fish-speech-1.5"
+                if os.path.exists(fish_path):
+                    self.fish_model = {"loaded": True, "path": fish_path}
+                else:
+                    # Try to use fish-audio-sdk as fallback
+                    self.fish_model = {"loaded": True, "type": "sdk"}
+                logger.info("Fish Speech 1.5 ready")
             except Exception as e:
                 logger.error(f"Failed to load Fish Speech: {e}")
                 raise
         return self.fish_model
     
-    async def load_styletts2(self):
+    def load_styletts2(self):
         """Load StyleTTS2 model"""
         if self.styletts_model is None:
             logger.info("Loading StyleTTS2...")
@@ -116,42 +200,75 @@ class ModelManager:
                 raise
         return self.styletts_model
     
-    async def load_mistral(self):
-        """Load Mistral 7B model"""
-        if self.mistral_model is None:
-            logger.info("Loading Mistral 7B...")
+    def load_llm(self, model_name: str = None):
+        """Load LLM via Ollama or vLLM"""
+        settings = load_settings()
+        model = model_name or settings.get("llm_model", "mistral-uncensored")
+        
+        if self.llm is None or getattr(self.llm, 'model_name', None) != model:
+            logger.info(f"Loading LLM: {model}...")
             try:
+                # Try vLLM first for better performance
                 from vllm import LLM, SamplingParams
-                model_path = f"{MODELS_DIR}/mistral-7b-instruct"
-                if not os.path.exists(model_path):
-                    model_path = "mistralai/Mistral-7B-Instruct-v0.3"
                 
-                self.mistral_model = LLM(
-                    model=model_path,
+                # Map friendly names to HuggingFace models
+                model_map = {
+                    "mistral-uncensored": "cognitivecomputations/dolphin-2.9-llama3-8b",
+                    "dolphin-mistral": "cognitivecomputations/dolphin-2.9-llama3-8b",
+                    "llama2-uncensored": "georgesung/llama2_7b_chat_uncensored",
+                    "llama3": "meta-llama/Meta-Llama-3-8B-Instruct",
+                    "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.3"
+                }
+                
+                hf_model = model_map.get(model, model)
+                
+                self.llm = LLM(
+                    model=hf_model,
                     tensor_parallel_size=1,
-                    gpu_memory_utilization=0.8,
-                    max_model_len=8192
+                    gpu_memory_utilization=0.7,
+                    max_model_len=4096,
+                    trust_remote_code=True
                 )
-                logger.info("Mistral 7B loaded successfully")
+                self.llm.model_name = model
+                logger.info(f"LLM loaded: {model} via vLLM")
             except Exception as e:
-                logger.error(f"Failed to load Mistral: {e}")
-                # Fallback to transformers
+                logger.warning(f"vLLM failed, trying transformers: {e}")
                 try:
                     from transformers import AutoModelForCausalLM, AutoTokenizer
-                    self.mistral_tokenizer = AutoTokenizer.from_pretrained(
-                        "mistralai/Mistral-7B-Instruct-v0.3"
-                    )
-                    self.mistral_model = AutoModelForCausalLM.from_pretrained(
-                        "mistralai/Mistral-7B-Instruct-v0.3",
+                    
+                    model_map = {
+                        "mistral-uncensored": "cognitivecomputations/dolphin-2.9-llama3-8b",
+                        "dolphin-mistral": "cognitivecomputations/dolphin-2.9-llama3-8b",
+                    }
+                    hf_model = model_map.get(model, model)
+                    
+                    tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
+                    llm_model = AutoModelForCausalLM.from_pretrained(
+                        hf_model,
                         torch_dtype=torch.float16,
                         device_map="auto",
-                        load_in_4bit=True
+                        trust_remote_code=True
                     )
-                    logger.info("Mistral 7B loaded via transformers (fallback)")
+                    self.llm = {"model": llm_model, "tokenizer": tokenizer, "type": "transformers"}
+                    self.llm["model_name"] = model
+                    logger.info(f"LLM loaded: {model} via transformers")
                 except Exception as e2:
-                    logger.error(f"Fallback also failed: {e2}")
+                    logger.error(f"All LLM loading methods failed: {e2}")
                     raise
-        return self.mistral_model
+        return self.llm
+    
+    def load_whisper(self):
+        """Load Whisper for STT"""
+        if self.whisper_model is None:
+            logger.info("Loading Whisper...")
+            try:
+                import whisper
+                self.whisper_model = whisper.load_model("base", device=DEVICE)
+                logger.info("Whisper loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load Whisper: {e}")
+                raise
+        return self.whisper_model
 
 # Global model manager
 models = ModelManager()
@@ -160,8 +277,8 @@ models = ModelManager()
 
 app = FastAPI(
     title="ARIA Voice Agent API",
-    description="Unified API for TTS (Fish Speech, XTTS v2, StyleTTS2) and LLM (Mistral 7B)",
-    version="1.0.0"
+    description="Complete standalone API: TTS (Fish Speech, XTTS, StyleTTS2) + LLM (Llama/Mistral Uncensored) + STT",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -172,100 +289,214 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== ENDPOINTS ====================
+# ==================== CORE ENDPOINTS ====================
 
-@app.get("/", response_model=Dict[str, str])
+@app.get("/")
 async def root():
     return {
         "service": "ARIA Voice Agent API",
-        "version": "1.0.0",
-        "engines": "Fish Speech 1.5, XTTS v2, StyleTTS2, Mistral 7B"
+        "version": "2.0.0",
+        "status": "online",
+        "device": DEVICE,
+        "endpoints": {
+            "chat": "/api/chat",
+            "tts": "/api/tts",
+            "stt": "/api/stt",
+            "settings": "/api/settings",
+            "voices": "/api/voices",
+            "conversations": "/api/conversations"
+        }
     }
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health_check():
-    """Check service health and model availability"""
-    gpu_name = None
+    """Health check for your mobile app"""
+    gpu_info = None
     if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
+        gpu_info = {
+            "name": torch.cuda.get_device_name(0),
+            "memory_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+        }
     
-    return HealthResponse(
-        status="healthy",
-        engines={
+    return {
+        "status": "healthy",
+        "gpu": gpu_info,
+        "models_loaded": {
             "xtts": models.xtts_model is not None,
             "fish_speech": models.fish_model is not None,
             "styletts2": models.styletts_model is not None,
-            "mistral": models.mistral_model is not None
-        },
-        gpu_available=torch.cuda.is_available(),
-        gpu_name=gpu_name
-    )
+            "llm": models.llm is not None,
+            "whisper": models.whisper_model is not None
+        }
+    }
+
+# ==================== SETTINGS ENDPOINTS ====================
+
+@app.get("/api/settings", response_model=SettingsModel)
+async def get_settings():
+    """Get current settings"""
+    return load_settings()
+
+@app.put("/api/settings", response_model=SettingsModel)
+async def update_settings(settings: SettingsModel):
+    """Update settings"""
+    save_settings(settings.model_dump())
+    return settings
+
+@app.patch("/api/settings")
+async def patch_settings(updates: Dict[str, Any]):
+    """Partially update settings"""
+    current = load_settings()
+    current.update(updates)
+    save_settings(current)
+    return current
+
+# ==================== CHAT/LLM ENDPOINTS ====================
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Chat with the LLM (Mistral Uncensored / Dolphin / Llama)
+    Uses settings for system prompt, temperature, etc.
+    """
+    settings = load_settings()
+    
+    try:
+        llm = models.load_llm(settings.get("llm_model"))
+        
+        # Build prompt with system message
+        system_prompt = settings.get("system_prompt", DEFAULT_SETTINGS["system_prompt"])
+        temperature = request.temperature or settings.get("temperature", 0.8)
+        max_tokens = request.max_tokens or settings.get("max_tokens", 2048)
+        top_p = request.top_p or settings.get("top_p", 0.9)
+        
+        # Format messages
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in request.messages:
+            messages.append({"role": msg.role, "content": msg.content})
+        
+        # Generate response
+        if hasattr(llm, 'generate'):  # vLLM
+            from vllm import SamplingParams
+            
+            # Format for chat
+            prompt = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    prompt += f"<|system|>\n{msg['content']}</s>\n"
+                elif msg["role"] == "user":
+                    prompt += f"<|user|>\n{msg['content']}</s>\n"
+                elif msg["role"] == "assistant":
+                    prompt += f"<|assistant|>\n{msg['content']}</s>\n"
+            prompt += "<|assistant|>\n"
+            
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens
+            )
+            outputs = llm.generate([prompt], sampling_params)
+            response_text = outputs[0].outputs[0].text
+            tokens_used = len(outputs[0].outputs[0].token_ids)
+            
+        else:  # transformers
+            tokenizer = llm["tokenizer"]
+            model = llm["model"]
+            
+            # Build prompt
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+            
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            response_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            tokens_used = outputs.shape[1]
+        
+        return ChatResponse(
+            response=response_text.strip(),
+            tokens_used=tokens_used,
+            model=settings.get("llm_model", "unknown")
+        )
+        
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/chat/simple")
+async def chat_simple(text: str = Form(...)):
+    """Simple chat endpoint - just send text, get response"""
+    request = ChatRequest(messages=[ChatMessage(role="user", content=text)])
+    return await chat(request)
+
+# ==================== TTS ENDPOINTS ====================
 
 @app.post("/api/tts", response_model=TTSResponse)
 async def text_to_speech(request: TTSRequest):
     """
-    Generate speech from text using specified engine
+    Generate speech from text
     Engines: xtts, fish, styletts2
     """
+    settings = load_settings()
+    engine = request.engine or settings.get("tts_engine", "xtts")
+    
     try:
         audio_data = None
         sample_rate = 24000
         
-        if request.engine == "xtts":
-            model = await models.load_xtts()
+        if engine == "xtts":
+            model = models.load_xtts()
+            voice_path = request.voice
             
-            # Generate with XTTS v2
-            if request.voice and os.path.exists(request.voice):
-                # Voice cloning from reference audio
-                wav = model.tts(
-                    text=request.text,
-                    speaker_wav=request.voice,
-                    language=request.language
-                )
+            # Check for custom voice
+            if voice_path and os.path.exists(voice_path):
+                wav = model.tts(text=request.text, speaker_wav=voice_path, language=request.language)
+            elif voice_path and os.path.exists(f"{DATA_DIR}/voices/{voice_path}.wav"):
+                wav = model.tts(text=request.text, speaker_wav=f"{DATA_DIR}/voices/{voice_path}.wav", language=request.language)
             else:
-                # Use default speaker
-                wav = model.tts(
-                    text=request.text,
-                    language=request.language
-                )
+                wav = model.tts(text=request.text, language=request.language)
+            
             audio_data = np.array(wav)
             sample_rate = 24000
             
-        elif request.engine == "fish":
-            model = await models.load_fish_speech()
-            # Fish Speech inference
-            # This would use the fish-audio-sdk or local inference
-            # For now, fallback to XTTS if Fish not fully configured
-            logger.warning("Fish Speech: Using local inference pipeline")
+        elif engine == "fish":
+            models.load_fish_speech()
+            # Try fish-audio-sdk
             try:
-                # Try fish-audio-sdk for cloud API
                 from fish_audio_sdk import Session, TTSRequest as FishTTSRequest
-                session = Session(os.environ.get("FISH_API_KEY", ""))
-                buffer = io.BytesIO()
-                for chunk in session.tts(FishTTSRequest(text=request.text)):
-                    buffer.write(chunk)
-                buffer.seek(0)
-                audio_data, sample_rate = sf.read(buffer)
+                api_key = os.environ.get("FISH_API_KEY", "")
+                if api_key:
+                    session = Session(api_key)
+                    buffer = io.BytesIO()
+                    for chunk in session.tts(FishTTSRequest(text=request.text)):
+                        buffer.write(chunk)
+                    buffer.seek(0)
+                    audio_data, sample_rate = sf.read(buffer)
+                else:
+                    raise Exception("No FISH_API_KEY, falling back")
             except Exception as e:
-                logger.error(f"Fish Speech error: {e}, falling back to XTTS")
+                logger.warning(f"Fish Speech fallback to XTTS: {e}")
                 # Fallback to XTTS
-                xtts = await models.load_xtts()
-                wav = xtts.tts(text=request.text, language=request.language)
+                model = models.load_xtts()
+                wav = model.tts(text=request.text, language=request.language)
                 audio_data = np.array(wav)
                 
-        elif request.engine == "styletts2":
-            model = await models.load_styletts2()
+        elif engine == "styletts2":
+            model = models.load_styletts2()
             
-            # Generate with StyleTTS2
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
             
-            if request.voice and os.path.exists(request.voice):
-                model.inference(
-                    request.text,
-                    target_voice_path=request.voice,
-                    output_wav_file=tmp_path
-                )
+            voice_path = request.voice
+            if voice_path and os.path.exists(voice_path):
+                model.inference(request.text, target_voice_path=voice_path, output_wav_file=tmp_path)
+            elif voice_path and os.path.exists(f"{DATA_DIR}/voices/{voice_path}.wav"):
+                model.inference(request.text, target_voice_path=f"{DATA_DIR}/voices/{voice_path}.wav", output_wav_file=tmp_path)
             else:
                 model.inference(request.text, output_wav_file=tmp_path)
             
@@ -273,7 +504,12 @@ async def text_to_speech(request: TTSRequest):
             os.unlink(tmp_path)
             
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown engine: {request.engine}")
+            raise HTTPException(status_code=400, detail=f"Unknown TTS engine: {engine}")
+        
+        # Apply speed adjustment if needed
+        if request.speed != 1.0:
+            import librosa
+            audio_data = librosa.effects.time_stretch(audio_data.astype(np.float32), rate=request.speed)
         
         # Convert to base64
         buffer = io.BytesIO()
@@ -286,8 +522,8 @@ async def text_to_speech(request: TTSRequest):
         return TTSResponse(
             audio_base64=audio_base64,
             format="wav",
-            engine=request.engine,
-            duration=duration
+            engine=engine,
+            duration=round(duration, 2)
         )
         
     except Exception as e:
@@ -296,41 +532,22 @@ async def text_to_speech(request: TTSRequest):
 
 @app.post("/api/tts/stream")
 async def text_to_speech_stream(request: TTSRequest):
-    """Stream TTS audio (for real-time applications)"""
-    try:
-        if request.engine == "xtts":
-            model = await models.load_xtts()
-            wav = model.tts(text=request.text, language=request.language)
-            audio_data = np.array(wav)
-            
-            buffer = io.BytesIO()
-            sf.write(buffer, audio_data, 24000, format='WAV')
-            buffer.seek(0)
-            
-            return StreamingResponse(
-                buffer,
-                media_type="audio/wav",
-                headers={"Content-Disposition": "attachment; filename=speech.wav"}
-            )
-        else:
-            # For non-streaming engines, use regular endpoint
-            result = await text_to_speech(request)
-            audio_bytes = base64.b64decode(result.audio_base64)
-            return StreamingResponse(
-                io.BytesIO(audio_bytes),
-                media_type="audio/wav"
-            )
-    except Exception as e:
-        logger.error(f"TTS stream error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Stream TTS audio directly"""
+    result = await text_to_speech(request)
+    audio_bytes = base64.b64decode(result.audio_base64)
+    return StreamingResponse(
+        io.BytesIO(audio_bytes),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f"attachment; filename=speech.wav"}
+    )
+
+# ==================== STT ENDPOINTS ====================
 
 @app.post("/api/stt")
 async def speech_to_text(file: UploadFile = File(...), language: str = Form("en")):
-    """
-    Transcribe audio to text using Whisper
-    """
+    """Transcribe audio to text"""
     try:
-        import whisper
+        whisper = models.load_whisper()
         
         # Save uploaded file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -338,176 +555,182 @@ async def speech_to_text(file: UploadFile = File(...), language: str = Form("en"
             tmp.write(content)
             tmp_path = tmp.name
         
-        # Load whisper model (cached after first load)
-        model = whisper.load_model("base")
-        result = model.transcribe(tmp_path, language=language)
-        
+        result = whisper.transcribe(tmp_path, language=language)
         os.unlink(tmp_path)
         
         return {
-            "text": result["text"],
-            "language": result.get("language", language),
-            "segments": result.get("segments", [])
+            "text": result["text"].strip(),
+            "language": result.get("language", language)
         }
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Whisper not installed")
     except Exception as e:
         logger.error(f"STT error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """
-    Chat with Mistral 7B model
-    """
-    try:
-        model = await models.load_mistral()
-        
-        # Format messages for Mistral
-        prompt = ""
-        for msg in request.messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                prompt += f"[INST] {content} [/INST]\n"
-            elif role == "user":
-                prompt += f"[INST] {content} [/INST]\n"
-            elif role == "assistant":
-                prompt += f"{content}\n"
-        
-        # Check if using vLLM or transformers
-        if hasattr(model, 'generate'):  # vLLM
-            from vllm import SamplingParams
-            sampling_params = SamplingParams(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                max_tokens=request.max_tokens
-            )
-            outputs = model.generate([prompt], sampling_params)
-            response_text = outputs[0].outputs[0].text
-            tokens_used = len(outputs[0].outputs[0].token_ids)
-        else:  # transformers fallback
-            inputs = models.mistral_tokenizer(prompt, return_tensors="pt").to(DEVICE)
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=request.max_tokens,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                do_sample=True
-            )
-            response_text = models.mistral_tokenizer.decode(
-                outputs[0][inputs.input_ids.shape[1]:],
-                skip_special_tokens=True
-            )
-            tokens_used = outputs.shape[1]
-        
-        return ChatResponse(
-            response=response_text.strip(),
-            tokens_used=tokens_used,
-            model="mistral-7b-instruct"
-        )
-        
-    except Exception as e:
-        logger.error(f"Chat error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """Stream chat response (for real-time conversation)"""
-    # For now, return non-streaming response
-    # Streaming would require websockets or SSE
-    result = await chat(request)
-    return result
+# ==================== VOICE MANAGEMENT ====================
 
 @app.get("/api/voices")
 async def list_voices():
-    """List available voices for each TTS engine"""
+    """List available voices"""
+    voices_dir = Path(f"{DATA_DIR}/voices")
+    custom_voices = []
+    
+    if voices_dir.exists():
+        custom_voices = [f.stem for f in voices_dir.glob("*.wav")]
+    
     return {
-        "xtts": {
-            "description": "XTTS v2 - Voice cloning from reference audio",
-            "languages": ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh", "ja", "ko", "hu"],
-            "supports_cloning": True
-        },
-        "fish": {
-            "description": "Fish Speech 1.5 - High quality multilingual TTS",
-            "languages": ["en", "zh", "ja"],
-            "supports_cloning": True
-        },
-        "styletts2": {
-            "description": "StyleTTS2 - Style-based TTS with voice cloning",
-            "languages": ["en"],
-            "supports_cloning": True
-        }
-    }
-
-@app.post("/api/voice/clone")
-async def clone_voice(
-    name: str = Form(...),
-    reference_audio: UploadFile = File(...)
-):
-    """Upload reference audio for voice cloning"""
-    try:
-        # Save reference audio
-        voices_dir = Path("/app/voices")
-        voices_dir.mkdir(exist_ok=True)
-        
-        voice_path = voices_dir / f"{name}.wav"
-        content = await reference_audio.read()
-        
-        with open(voice_path, "wb") as f:
-            f.write(content)
-        
-        return {
-            "status": "success",
-            "voice_name": name,
-            "voice_path": str(voice_path)
-        }
-    except Exception as e:
-        logger.error(f"Voice clone error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/models")
-async def list_models():
-    """List loaded models and their status"""
-    return {
-        "tts_engines": {
-            "xtts_v2": {
-                "loaded": models.xtts_model is not None,
-                "description": "Coqui XTTS v2 - Multilingual voice cloning"
+        "engines": {
+            "xtts": {
+                "description": "XTTS v2 - Multilingual voice cloning",
+                "languages": ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh", "ja", "ko"],
+                "supports_cloning": True
             },
-            "fish_speech": {
-                "loaded": models.fish_model is not None,
-                "description": "Fish Speech 1.5 - High quality TTS"
+            "fish": {
+                "description": "Fish Speech 1.5 - High quality TTS",
+                "languages": ["en", "zh", "ja"],
+                "supports_cloning": True
             },
             "styletts2": {
-                "loaded": models.styletts_model is not None,
-                "description": "StyleTTS2 - Style transfer TTS"
+                "description": "StyleTTS2 - Style-based TTS",
+                "languages": ["en"],
+                "supports_cloning": True
             }
         },
-        "llm": {
-            "mistral_7b": {
-                "loaded": models.mistral_model is not None,
-                "description": "Mistral 7B Instruct v0.3"
-            }
-        }
+        "custom_voices": custom_voices
     }
+
+@app.post("/api/voices/upload")
+async def upload_voice(name: str = Form(...), audio: UploadFile = File(...)):
+    """Upload a voice sample for cloning"""
+    voices_dir = Path(f"{DATA_DIR}/voices")
+    voices_dir.mkdir(exist_ok=True)
+    
+    voice_path = voices_dir / f"{name}.wav"
+    content = await audio.read()
+    
+    with open(voice_path, "wb") as f:
+        f.write(content)
+    
+    return {"status": "success", "voice_name": name, "path": str(voice_path)}
+
+@app.delete("/api/voices/{name}")
+async def delete_voice(name: str):
+    """Delete a custom voice"""
+    voice_path = Path(f"{DATA_DIR}/voices/{name}.wav")
+    if voice_path.exists():
+        voice_path.unlink()
+        return {"status": "deleted", "voice_name": name}
+    raise HTTPException(status_code=404, detail="Voice not found")
+
+# ==================== CONVERSATION MANAGEMENT ====================
+
+@app.get("/api/conversations")
+async def list_conversations():
+    """List all conversations"""
+    return {"conversations": list(conversations.values())}
+
+@app.post("/api/conversations")
+async def create_conversation(name: str = "New Conversation"):
+    """Create a new conversation"""
+    convo = Conversation(name=name)
+    conversations[convo.id] = convo.model_dump()
+    save_conversations(conversations)
+    return convo
+
+@app.get("/api/conversations/{convo_id}")
+async def get_conversation(convo_id: str):
+    """Get a conversation by ID"""
+    if convo_id not in conversations:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversations[convo_id]
+
+@app.delete("/api/conversations/{convo_id}")
+async def delete_conversation(convo_id: str):
+    """Delete a conversation"""
+    if convo_id in conversations:
+        del conversations[convo_id]
+        save_conversations(conversations)
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Conversation not found")
+
+@app.post("/api/conversations/{convo_id}/chat")
+async def chat_in_conversation(convo_id: str, text: str = Form(...)):
+    """Chat within a specific conversation (maintains history)"""
+    if convo_id not in conversations:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    convo = conversations[convo_id]
+    
+    # Add user message
+    user_msg = ConversationMessage(role="user", content=text)
+    convo["messages"].append(user_msg.model_dump())
+    
+    # Build chat request with history
+    messages = [ChatMessage(role=m["role"], content=m["content"]) for m in convo["messages"]]
+    request = ChatRequest(messages=messages)
+    
+    # Get response
+    response = await chat(request)
+    
+    # Add assistant message
+    assistant_msg = ConversationMessage(role="assistant", content=response.response)
+    convo["messages"].append(assistant_msg.model_dump())
+    
+    save_conversations(conversations)
+    
+    return {
+        "response": response.response,
+        "conversation_id": convo_id,
+        "message_count": len(convo["messages"])
+    }
+
+# ==================== LLM MODEL MANAGEMENT ====================
+
+@app.get("/api/models")
+async def list_available_models():
+    """List available LLM models"""
+    return {
+        "available_models": [
+            {"id": "mistral-uncensored", "name": "Dolphin Mistral (Uncensored)", "description": "Unrestricted Mistral-based model"},
+            {"id": "dolphin-mistral", "name": "Dolphin 2.9 Llama3", "description": "Uncensored Llama 3 fine-tune"},
+            {"id": "llama2-uncensored", "name": "Llama 2 Uncensored", "description": "Unrestricted Llama 2 7B"},
+            {"id": "llama3", "name": "Llama 3 8B Instruct", "description": "Meta's Llama 3"},
+            {"id": "mistral-7b", "name": "Mistral 7B Instruct", "description": "Official Mistral 7B"}
+        ],
+        "current_model": load_settings().get("llm_model", "mistral-uncensored")
+    }
+
+@app.post("/api/models/switch")
+async def switch_model(model_id: str = Form(...)):
+    """Switch the active LLM model"""
+    settings = load_settings()
+    settings["llm_model"] = model_id
+    save_settings(settings)
+    
+    # Clear loaded model to force reload
+    models.llm = None
+    
+    return {"status": "switched", "model": model_id}
 
 # ==================== STARTUP ====================
 
 @app.on_event("startup")
 async def startup_event():
-    """Pre-load models on startup"""
-    logger.info("=" * 50)
-    logger.info("ARIA Voice Agent API Starting...")
+    """Startup tasks"""
+    logger.info("=" * 60)
+    logger.info("ARIA Voice Agent API v2.0 - Starting...")
     logger.info(f"Device: {DEVICE}")
     if torch.cuda.is_available():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    logger.info("=" * 50)
+    logger.info(f"Models directory: {MODELS_DIR}")
+    logger.info(f"Data directory: {DATA_DIR}")
+    logger.info("=" * 60)
     
-    # Optionally pre-load models (comment out for lazy loading)
-    # await models.load_xtts()
-    # await models.load_mistral()
+    # Load settings
+    settings = load_settings()
+    logger.info(f"Persona: {settings.get('persona_name', 'ARIA')}")
+    logger.info(f"LLM Model: {settings.get('llm_model', 'mistral-uncensored')}")
+    logger.info(f"TTS Engine: {settings.get('tts_engine', 'xtts')}")
 
 # ==================== MAIN ====================
 
