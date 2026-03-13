@@ -55,7 +55,9 @@ export default function SettingsPage() {
     runpod_api_key: "",
     default_model: "gpt-5.2",
     default_voice: "nova",
-    tts_speed: 1.0
+    tts_speed: 1.0,
+    tts_engine: "openai",
+    llm_backend: "openai"
   });
   const [isSaving, setIsSaving] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
